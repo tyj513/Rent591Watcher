@@ -2,31 +2,56 @@ name: Rent591Watcher
 
 on:
   schedule:
-  # scheduled at 8, 16, 0am (UTC+8), weekdays
-    - cron: "0 0,8,16 * * *"
+  # 每 2 小時執行一次
+    - cron: "0 */2 * * *"
   workflow_dispatch:
-
-env:
-  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
 
 jobs:
   scrape-latest:
     runs-on: ubuntu-latest
+    # 需要寫入權限才能把 sent_ids.json commit 回 repo
+    permissions:
+      contents: write
+    # 避免兩次排程同時跑造成 commit 衝突
+    concurrency:
+      group: rent591watcher
+      cancel-in-progress: false
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v2
-      
+        uses: actions/checkout@v4
+
       - name: Set up Python
-        uses: actions/setup-python@v2.0.0
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      
+
       - name: Install requirements
         run: pip install -r requirements.txt
-      
+
       - name: Run Python Code
         env:
           URL: ${{ secrets.URL }}
-          TG_CHANNEL: ${{ secrets.TG_CHANNEL }}
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_TO: ${{ secrets.LINE_TO }}
+          WITHIN_HOURS: "4"
+          WANTED_PAGE: "3"
         run: python main.py
+
+      - name: Commit sent_ids.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- sent_ids.json && git diff --cached --quiet -- sent_ids.json && [ -z "$(git ls-files --others --exclude-standard -- sent_ids.json)" ]; then
+            echo "no change in sent_ids.json"
+            exit 0
+          fi
+          git add sent_ids.json
+          git commit -m "chore: update sent_ids [skip ci]"
+          # 若排程重疊導致遠端已更新，rebase 後再推
+          for i in 1 2 3; do
+            git pull --rebase --autostash origin ${{ github.ref_name }} && git push && exit 0
+            echo "retry $i"
+            sleep 5
+          done
+          echo "failed to push sent_ids.json" >&2
+          exit 1
