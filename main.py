@@ -22,6 +22,13 @@ SUBSIDY_KEYWORDS = ('租補', '租金補貼', '房屋補貼', '補貼', '補助'
 # 出現在關鍵字前面就視為否定，例如「不可租補」「無法申請補貼」
 SUBSIDY_NEGATIONS = ('不可', '不能', '無法', '恕不', '不提供', '不含', '沒有', '不予', '不接受', '不行')
 
+# 591 會間歇性回 403（尤其從機房 IP），用退避重試把成功率拉高
+RETRY_TRIES = int(os.environ.get('RETRY_TRIES', '').strip() or 4)
+RETRY_BASE_WAIT = 8      # 第一次等 8 秒，之後 16、32…
+RETRY_MAX_WAIT = 60
+DETAIL_RETRY_TRIES = 2   # 單一物件抓不到不嚴重（下次會再抓），少試幾次避免整體太慢
+MAX_CONSECUTIVE_FAILS = 6  # 連續這麼多筆抓不到就視為被擋，提早收工
+
 SENT_IDS_FILE = 'sent_ids.json'   # 已處理過的物件 ID 紀錄
 SEEN_TTL_DAYS = 14                # 紀錄保留天數，超過就清掉避免檔案無限長大
 
@@ -115,12 +122,41 @@ class Rent591Watcher:
         self.within_hours = within_hours
         self.send_failed = False
 
+    def _fetch(self, session, url, headers, label, tries=None):
+        """591 會間歇性回 403，退避後重試；每次重試前重新暖身取得新的 cookie。"""
+        tries = tries or RETRY_TRIES
+        r = None
+        for attempt in range(1, tries + 1):
+            try:
+                r = session.get(url, headers=headers, timeout=30)
+            except requests.RequestException as e:
+                print(f'Warning: {label} 連線失敗 ({e.__class__.__name__}) [{attempt}/{tries}]')
+                r = None
+            else:
+                if r.status_code == 200:
+                    return r
+                print(f'Warning: {label} returned HTTP {r.status_code} [{attempt}/{tries}]')
+
+            if attempt == tries:
+                break
+
+            wait = min(RETRY_MAX_WAIT, RETRY_BASE_WAIT * 2 ** (attempt - 1)) + random.uniform(0, 5)
+            print(f'  {wait:.0f} 秒後重試…')
+            time.sleep(wait)
+            try:   # 重新暖身，換一組 session cookie
+                session.get('https://rent.591.com.tw/', headers=self.headers, timeout=30)
+            except requests.RequestException:
+                pass
+        return r
+
     def get_house_id(self):
 
         # get token
         s = requests.Session()
         url = 'https://rent.591.com.tw/'
-        r = s.get(url, headers=self.headers)
+        r = self._fetch(s, url, self.headers, '首頁')
+        if r is None:
+            return []
         soup = BeautifulSoup(r.text, 'html.parser')
         token = soup.find('meta', attrs={'name': 'csrf-token'})
         headers = self.headers.copy()
@@ -133,9 +169,11 @@ class Rent591Watcher:
         page = 1
         while page <= self.wanted_page:
             url = self.search_url if page < 2 else f'{self.search_url}&page={page}'
-            r = s.get(url, headers=headers)
-            if r.status_code != 200:
-                print(f'Warning: list page {page} returned HTTP {r.status_code}')
+            r = self._fetch(s, url, headers, f'清單第 {page} 頁')
+            if r is None or r.status_code != 200:
+                print(f'清單第 {page} 頁重試後仍失敗，跳過')
+                page += 1
+                continue
             soup = BeautifulSoup(r.text, 'html.parser')
             house_ids += [i.get('href').split('/')[-1] for i in soup.find_all(class_="link v-middle")]
             page += 1
@@ -149,7 +187,9 @@ class Rent591Watcher:
 
         s = requests.Session()
         url = f'https://rent.591.com.tw/{house_id}'
-        r = s.get(url, headers=headers)
+        r = self._fetch(s, url, headers, f'物件 {house_id} 頁面', tries=DETAIL_RETRY_TRIES)
+        if r is None or r.status_code != 200:
+            return None
         soup = BeautifulSoup(r.text, 'html.parser')
         token = soup.find('meta', attrs={'name': 'csrf-token'})
 
@@ -171,7 +211,9 @@ class Rent591Watcher:
         headers.pop('Cache-Control', None)
 
         url = f'https://bff.591.com.tw/v1/house/rent/detail?id={house_id}'
-        r = s.get(url, headers=headers)
+        r = self._fetch(s, url, headers, f'物件 {house_id} API', tries=DETAIL_RETRY_TRIES)
+        if r is None or r.status_code != 200:
+            return None
         try:
             house_detail = r.json().get('data')
         except ValueError:
@@ -299,8 +341,19 @@ class Rent591Watcher:
         messages = []
         to_mark = []      # 這輪要記錄的 ID（沒送出的，例如太舊或解析失敗）
         pending = []      # 有訊息要送的 ID，等送成功才記錄
+        consecutive_fails = 0
         for id in new_ids:
             house_detail = self.get_house_detail(id)
+
+            # 連續抓不到通常代表整個被擋了，繼續硬跑只是浪費時間。
+            # 這些 ID 不會被標記，下次執行會重新嘗試。
+            if house_detail is None:
+                consecutive_fails += 1
+                if consecutive_fails >= MAX_CONSECUTIVE_FAILS:
+                    print(f'連續 {consecutive_fails} 筆抓不到詳情，判定被擋，提早結束本輪')
+                    break
+            else:
+                consecutive_fails = 0
 
             if isinstance(house_detail, str):
                 try:
