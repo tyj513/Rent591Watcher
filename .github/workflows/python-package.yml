@@ -2,8 +2,8 @@ name: Rent591Watcher
 
 on:
   schedule:
-  # 每 2 小時執行一次
-    - cron: "0 */2 * * *"
+  # 每 1 小時執行一次
+    - cron: "0 */1 * * *"
   workflow_dispatch:
 
 jobs:
