@@ -33,7 +33,7 @@ jobs:
           URL: ${{ secrets.URL }}
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_TO: ${{ secrets.LINE_TO }}
-          WITHIN_HOURS: "4"
+          WITHIN_HOURS: "48"
           WANTED_PAGE: "3"
         run: python main.py
 

@@ -7,6 +7,7 @@ import time
 import re
 import os
 import sys
+import html
 
 LINE_API_BASE = 'https://api.line.me/v2/bot/message'
 LINE_TEXT_LIMIT = 4900   # LINE 單則文字上限 5000，留一點餘裕
@@ -16,8 +17,45 @@ class ScrapeEmptyError(RuntimeError):
     """清單頁一筆都沒抓到，通常代表被擋或網址有問題。"""
 
 
+# 591 沒有「可否租金補貼」的結構化欄位，只能從標題和屋況介紹的自由文字判斷。
+SUBSIDY_KEYWORDS = ('租補', '租金補貼', '房屋補貼', '補貼', '補助')
+# 出現在關鍵字前面就視為否定，例如「不可租補」「無法申請補貼」
+SUBSIDY_NEGATIONS = ('不可', '不能', '無法', '恕不', '不提供', '不含', '沒有', '不予', '不接受', '不行')
+
 SENT_IDS_FILE = 'sent_ids.json'   # 已處理過的物件 ID 紀錄
 SEEN_TTL_DAYS = 14                # 紀錄保留天數，超過就清掉避免檔案無限長大
+
+
+def strip_html(raw):
+    """屋況介紹是被跳脫過的 HTML（有時甚至跳脫兩次），還原成純文字。"""
+    if not raw:
+        return ''
+    text = html.unescape(html.unescape(str(raw)))
+    text = re.sub(r'<[^>]+>', ' ', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def detect_subsidy(house_detail):
+    """判斷是否可申請租金補貼。回傳 '可申請' / '不可' / '未註明'。"""
+    title = house_detail.get('title') or ''
+    remark = house_detail.get('remark') or {}
+    blob = f'{title} {strip_html(remark.get("content"))}'
+
+    found_positive = False
+    found_negative = False
+    for kw in SUBSIDY_KEYWORDS:
+        for m in re.finditer(re.escape(kw), blob):
+            before = blob[max(0, m.start() - 6):m.start()]
+            if any(neg in before for neg in SUBSIDY_NEGATIONS):
+                found_negative = True
+            else:
+                found_positive = True
+
+    if found_positive:
+        return '可申請'
+    if found_negative:
+        return '不可'
+    return '未註明'
 
 
 def load_sent_ids(path=SENT_IDS_FILE):
@@ -53,7 +91,7 @@ def save_sent_ids(sent_ids, path=SENT_IDS_FILE):
 
 
 class Rent591Watcher:
-    def __init__(self, url: str, line_token: str, line_to: str = '', wanted_page: int = 2, within_hours: float = 8):
+    def __init__(self, url: str, line_token: str, line_to: str = '', wanted_page: int = 2, within_hours: float = 24):
         # 盡量貼近真實瀏覽器，降低被判定成機器人的機率。
         # 注意：不要寫死 Cookie（Session 會自動處理）也不要寫死 Host（requests 會依網址自動設定，
         # 寫死會讓 bff.591.com.tw 那支 API 掛掉）。Accept-Encoding 不放 br，避免沒裝 brotli 導致亂碼。
@@ -153,10 +191,24 @@ class Rent591Watcher:
         post_time = house_detail.get('publish').get('postTime').replace('此房屋在', '')
         update_time = house_detail.get('publish').get('updateTime')
         time_ = f"{post_time}{' | ' + update_time if update_time else ''}"
-        note = house_detail.get('favData').get('other').get('desc')
         link = f'https://rent.591.com.tw/{id}'
 
-        return (f"\n{house_type} | {price} \n{area} | {floor} | {shape}\n{address}\n{time_}\n*{note}\n{link}")
+        title = (house_detail.get('title') or '').strip()
+        if len(title) > 40:
+            title = title[:40] + '…'
+
+        subsidy = detect_subsidy(house_detail)
+        subsidy_line = {'可申請': '租補：可申請 ✅', '不可': '租補：不可 ❌'}.get(subsidy, '租補：未註明')
+
+        return (
+            f"\n🏠 {title}"
+            f"\n{house_type} | {price} 元/月"
+            f"\n坪數 {area} | {floor} | {shape}"
+            f"\n{address}"
+            f"\n{subsidy_line}"
+            f"\n{time_}"
+            f"\n{link}"
+            )
 
     def transform_post_time(self, post_time):
         post_time = post_time.replace('此房屋在', '').replace('前發佈', '')
