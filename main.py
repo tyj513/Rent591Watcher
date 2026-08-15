@@ -12,6 +12,10 @@ LINE_API_BASE = 'https://api.line.me/v2/bot/message'
 LINE_TEXT_LIMIT = 4900   # LINE 單則文字上限 5000，留一點餘裕
 LINE_MAX_MESSAGES = 5    # 單次 request 最多 5 則 message
 
+class ScrapeEmptyError(RuntimeError):
+    """清單頁一筆都沒抓到，通常代表被擋或網址有問題。"""
+
+
 SENT_IDS_FILE = 'sent_ids.json'   # 已處理過的物件 ID 紀錄
 SEEN_TTL_DAYS = 14                # 紀錄保留天數，超過就清掉避免檔案無限長大
 
@@ -50,14 +54,28 @@ def save_sent_ids(sent_ids, path=SENT_IDS_FILE):
 
 class Rent591Watcher:
     def __init__(self, url: str, line_token: str, line_to: str = '', wanted_page: int = 2, within_hours: float = 8):
+        # 盡量貼近真實瀏覽器，降低被判定成機器人的機率。
+        # 注意：不要寫死 Cookie（Session 會自動處理）也不要寫死 Host（requests 會依網址自動設定，
+        # 寫死會讓 bff.591.com.tw 那支 API 掛掉）。Accept-Encoding 不放 br，避免沒裝 brotli 導致亂碼。
         self.headers = {
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/84.0.4147.125 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Encoding': 'gzip, deflate',
+            'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Cache-Control': 'max-age=0',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-User': '?1',
             }
         self.search_url = f"{url.replace('sort=posttime_desc', '')}&sort=posttime_desc"
         self.__line_token = line_token
         self.__line_to = line_to
         self.wanted_page = wanted_page
         self.within_hours = within_hours
+        self.send_failed = False
 
     def get_house_id(self):
 
@@ -72,11 +90,14 @@ class Rent591Watcher:
             headers['X-CSRF-TOKEN'] = token.get('content')
 
         # search
+        headers['Referer'] = 'https://rent.591.com.tw/'
         house_ids = []
         page = 1
         while page <= self.wanted_page:
             url = self.search_url if page < 2 else f'{self.search_url}&page={page}'
             r = s.get(url, headers=headers)
+            if r.status_code != 200:
+                print(f'Warning: list page {page} returned HTTP {r.status_code}')
             soup = BeautifulSoup(r.text, 'html.parser')
             house_ids += [i.get('href').split('/')[-1] for i in soup.find_all(class_="link v-middle")]
             page += 1
@@ -101,9 +122,23 @@ class Rent591Watcher:
             headers['deviceid'] = device_id
         headers['device'] = 'pc'
 
+        # 這支是 XHR API，headers 要換成 ajax 的樣子，Referer 指回該物件頁
+        headers['Accept'] = 'application/json, text/plain, */*'
+        headers['Referer'] = url
+        headers['Sec-Fetch-Dest'] = 'empty'
+        headers['Sec-Fetch-Mode'] = 'cors'
+        headers['Sec-Fetch-Site'] = 'same-site'
+        headers.pop('Upgrade-Insecure-Requests', None)
+        headers.pop('Sec-Fetch-User', None)
+        headers.pop('Cache-Control', None)
+
         url = f'https://bff.591.com.tw/v1/house/rent/detail?id={house_id}'
         r = s.get(url, headers=headers)
-        house_detail = r.json().get('data')
+        try:
+            house_detail = r.json().get('data')
+        except ValueError:
+            print(f'Warning: house {house_id} detail is not JSON (HTTP {r.status_code})')
+            house_detail = None
         time.sleep(random.uniform(1, 3))
         print(f'get {house_id} detail')
         return house_detail
@@ -192,6 +227,14 @@ class Rent591Watcher:
         sent_ids = {} if sent_ids is None else sent_ids
         house_ids = self.get_house_id()
 
+        # 抓到 0 筆幾乎都代表出問題了（被擋、網址錯、591 改版），
+        # 這種情況要讓 workflow 亮紅燈，不然會一直綠燈但其實什麼都沒做。
+        if not house_ids:
+            raise ScrapeEmptyError(
+                '清單頁抓到 0 筆物件。可能原因：URL secret 內容有誤、591 擋掉了執行環境的 IP、'
+                '或 591 改版導致選擇器 "link v-middle" 失效。'
+                )
+
         # 已處理過的直接跳過，連詳情都不用抓（省下每筆 1~3 秒的等待）
         new_ids, skipped = [], 0
         for id in house_ids:
@@ -256,6 +299,7 @@ class Rent591Watcher:
             for id in pending:
                 sent_ids[id] = now
         else:
+            self.send_failed = True
             print('Warning: some messages failed to send, those ids will be retried next run')
 
         return sent_ids
@@ -271,7 +315,8 @@ def get_env(name, required=True, default=''):
     return value
 
 
-if __name__ == '__main__':
+def main():
+    """回傳結束碼：0 正常，1 有問題（讓 GitHub Actions 亮紅燈）。"""
     url = get_env('URL')                                  # 591 搜尋網址
     line_token = get_env('LINE_CHANNEL_ACCESS_TOKEN')     # LINE Messaging API channel access token
     line_to = get_env('LINE_TO', required=False)          # 選填：user/group id，沒填就用 broadcast
@@ -283,6 +328,21 @@ if __name__ == '__main__':
     print(f'loaded {len(sent_ids)} known id(s)')
 
     bot = Rent591Watcher(url, line_token, line_to, wanted_page, within_hours)
-    sent_ids = bot.send_new_houses(sent_ids)
+    try:
+        sent_ids = bot.send_new_houses(sent_ids)
+    except ScrapeEmptyError as e:
+        print(f'Error: {e}')
+        return 1   # 這裡不存檔，避免把既有紀錄清空
 
     save_sent_ids(sent_ids)
+
+    # 先存檔再回報失敗，成功處理的紀錄才不會丟失；沒送出的下次會自動重送
+    if bot.send_failed:
+        print('Error: LINE 發送失敗，請檢查 LINE_CHANNEL_ACCESS_TOKEN 是否正確。')
+        return 1
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
