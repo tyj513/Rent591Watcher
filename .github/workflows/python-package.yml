@@ -2,8 +2,7 @@ name: Rent591Watcher
 
 on:
   schedule:
-  # 每 1 小時執行一次
-    - cron: "0 */1 * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -33,8 +32,8 @@ jobs:
           URL: ${{ secrets.URL }}
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_TO: ${{ secrets.LINE_TO }}
-          WITHIN_HOURS: "48"
-          WANTED_PAGE: "3"
+          WITHIN_HOURS: "6"
+          WANTED_PAGE: "2"
         run: python main.py
 
       - name: Commit sent_ids.json
