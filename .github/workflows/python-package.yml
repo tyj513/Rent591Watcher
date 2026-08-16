@@ -2,7 +2,8 @@ name: Rent591Watcher
 
 on:
   schedule:
-    - cron: "*/20 * * * *"
+    # 避開整點與 0/15/30/45 這些擁擠時段，降低被 GitHub 丟棄的機率
+    - cron: "7,27,47 * * * *"
   workflow_dispatch:
 
 jobs:
